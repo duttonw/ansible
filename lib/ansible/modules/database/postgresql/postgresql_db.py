@@ -33,11 +33,36 @@ options:
       - name of the database to add or remove
     required: true
     default: null
+  login_user:
+    description:
+      - The username used to authenticate with
+    required: false
+    default: null
+  login_password:
+    description:
+      - The password used to authenticate with
+    required: false
+    default: null
+  login_host:
+    description:
+      - Host running the database
+    required: false
+    default: localhost
+  login_unix_socket:
+    description:
+      - Path to a Unix domain socket for local connections
+    required: false
+    default: null
   owner:
     description:
       - Name of the role to set as owner of the database
     required: false
     default: null
+  port:
+    description:
+      - Database port to connect to.
+    required: false
+    default: 5432
   template:
     description:
       - Template used to create the database
@@ -60,10 +85,15 @@ options:
     default: null
   state:
     description:
-      - The database state
+      - The database state: "present", "absent", "dump", "restore" , dump/restore requires target (defaults to current db name in current folder)
     required: false
     default: present
-    choices: [ "present", "absent" ]
+    choices: [ "present", "absent", "dump", "restore" ]
+  target:
+    version_added: "2.2"
+    description:
+      - File to dump to or restore from. Supported formats are .gz, .tar, .bz, .xz, and .sql
+
 author: "Ansible Core Team"
 extends_documentation_fragment:
 - postgres
@@ -89,6 +119,10 @@ HAS_PSYCOPG2 = False
 try:
     import psycopg2
     import psycopg2.extras
+    import pipes
+    import subprocess
+    import os
+
 except ImportError:
     pass
 else:
@@ -203,6 +237,90 @@ def db_matches(cursor, db, owner, template, encoding, lc_collate, lc_ctype):
         else:
             return True
 
+def db_dump(module, host, user, password, db_name, target, port, socket=None):
+    cmd = ""
+    if password is not None:
+        cmd += "PGPASSWORD=%s " % pipes.quote(password)
+    cmd += module.get_bin_path('pg_dump', True)
+
+    if user is not None:
+        cmd += " --username=%s" % pipes.quote(user)
+    if socket is not None:
+        cmd += " --host=%s" % pipes.quote(socket)
+    else:
+        cmd += " --host=%s --port=%i" % (pipes.quote(host), pipes.quote(port))
+    if db_name is not None:
+        cmd += " --dbname=%s" % pipes.quote(db_name)
+    cmd += " --no-owner"
+
+    path = None
+    if os.path.splitext(target)[-1] == '.tar':
+        cmd += " --format=t"
+    if os.path.splitext(target)[-1] == '.gz':
+        path = module.get_bin_path('gzip', True)
+    elif os.path.splitext(target)[-1] == '.bz2':
+        path = module.get_bin_path('bzip2', True)
+    elif os.path.splitext(target)[-1] == '.xz':
+        path = module.get_bin_path('xz', True)
+
+    if path:
+        cmd = '%s | %s > %s' % (cmd, path, pipes.quote(target))
+    else:
+        cmd += " > %s" % pipes.quote(target)
+
+
+    rc, stdout, stderr = module.run_command(cmd, use_unsafe_shell=True)
+    return rc, stdout, stderr
+
+
+def db_import(module, host, user, password, db_name, target, port, socket=None):
+    if not os.path.exists(target):
+        return module.fail_json(msg="target %s does not exist on the host" % target)
+
+    cmd_base = ""
+    if password is not None:
+        cmd_base += "PGPASSWORD=%s " % pipes.quote(password)
+    cmd_base += module.get_bin_path('psql', True)
+    cmd = [cmd_base]
+
+    # set initial flags. These are the same in pg_restore as psql (not supporting pg_restore for now)
+    if user is not None:
+        cmd.append("--username=%s" % pipes.quote(user))
+    if socket is not None:
+        cmd.append("--host=%s" % pipes.quote(socket))
+    else:
+        cmd.append("--host=%s" % pipes.quote(host))
+        cmd.append("--port=%s" % pipes.quote(port))
+    if db_name is not None:
+        cmd.append("--dbname=%s" % pipes.quote(db_name))
+
+    comp_prog_path = None
+    if os.path.splitext(target)[-1] == '.gz':
+        comp_prog_path = module.get_bin_path('gzip', required=True)
+    elif os.path.splitext(target)[-1] == '.bz2':
+        comp_prog_path = module.get_bin_path('bzip2', required=True)
+    elif os.path.splitext(target)[-1] == '.xz':
+        comp_prog_path = module.get_bin_path('xz', required=True)
+    elif os.path.splitext(target)[-1] == '.tar':
+        return module.fail_json(msg="target %s not supported by psql as is custom pg_dump format" % target)
+
+    if comp_prog_path:
+        p1 = subprocess.Popen([comp_prog_path, '-dc', target], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p2 = subprocess.Popen(cmd, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+        (stdout2, stderr2) = p2.communicate()
+        p1.stdout.close()
+        p1.wait()
+        if p1.returncode != 0:
+            stderr1 = p1.stderr.read()
+            return p1.returncode, '', stderr1
+        else:
+            return p2.returncode, stdout2, stderr2
+    else:
+        cmd = ' '.join(cmd)
+        cmd += " < %s" % pipes.quote(target)
+        rc, stdout, stderr = module.run_command(cmd, use_unsafe_shell=True)
+        return rc, stdout, stderr
+
 # ===========================================
 # Module execution.
 #
@@ -216,7 +334,8 @@ def main():
         encoding=dict(default=""),
         lc_collate=dict(default=""),
         lc_ctype=dict(default=""),
-        state=dict(default="present", choices=["absent", "present"]),
+        target=dict(default=""),
+        state=dict(default="present", choices=["absent", "present", "dump", "import"]),
     ))
 
 
@@ -235,6 +354,7 @@ def main():
     encoding = module.params["encoding"]
     lc_collate = module.params["lc_collate"]
     lc_ctype = module.params["lc_ctype"]
+    target = module.params["target"]
     state = module.params["state"]
     sslrootcert = module.params["ssl_rootcert"]
     changed = False
@@ -251,12 +371,26 @@ def main():
         "ssl_rootcert":"sslrootcert"
     }
     kw = dict( (params_map[k], v) for (k, v) in iteritems(module.params)
-              if k in params_map and v != '' and v is not None)
+               if k in params_map and v != '' and v is not None)
+
+    login_unix_socket = module.params["login_unix_socket"]
+    login_port = kw["login_port"]
+    if login_port < 0 or login_port > 65535:
+        module.fail_json(msg="login_port must be a valid unix port number (0-65535)")
+    login_password = kw["login_password"]
+    login_user = kw["login_user"]
+    login_host = kw["login_host"]
 
     # If a login_unix_socket is specified, incorporate it here.
     is_localhost = "host" not in kw or kw["host"] == "" or kw["host"] == "localhost"
     if is_localhost and module.params["login_unix_socket"] != "":
         kw["host"] = module.params["login_unix_socket"]
+
+    if target == "":
+        target = "{0}/{1}.sql".format(os.getcwd(), db)
+        target = os.path.expanduser(target)
+    else:
+        target = os.path.expanduser(target)
 
     try:
         pgutils.ensure_libs(sslrootcert=module.params.get('ssl_rootcert'))
@@ -303,6 +437,22 @@ def main():
             except SQLParseError:
                 e = get_exception()
                 module.fail_json(msg=str(e))
+
+        elif state == "dump":
+            try:
+                changed = db_dump(module, login_host, login_user, login_password, db, target, port, login_unix_socket)
+
+            except Exception:
+                e = get_exception()
+                module.fail_json(msg=str(e))
+
+        elif state == "import":
+            rc, stdout, stderr = db_import(module, login_host, login_user, login_password, db, target, port, login_unix_socket)
+            if rc != 0:
+                module.fail_json(msg="{0}".format(stderr))
+            else:
+                module.exit_json(changed=True, msg=stdout)
+
     except NotSupportedError:
         e = get_exception()
         module.fail_json(msg=str(e))
@@ -315,5 +465,8 @@ def main():
 
     module.exit_json(changed=changed, db=db)
 
+# import module snippets
+from ansible.module_utils.basic import *
+from ansible.module_utils.database import *
 if __name__ == '__main__':
     main()
